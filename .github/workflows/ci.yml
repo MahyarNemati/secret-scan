@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --all-features
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The CLI tests shell out to git to build repositories and install
+      # hooks, so git identity has to exist on the runner.
+      - name: Configure git
+        run: |
+          git config --global user.email ci@example.test
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+      - run: cargo test --all
+
+  selfscan:
+    name: scans itself, including history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # --history needs the full history, not a shallow clone
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Dogfooding. This repository is full of credential-shaped strings by
+      # necessity, so .secret-scan.toml allows the test fixtures and the rule
+      # definitions with written reasons -- and --show-suppressed prints what
+      # was allowed, so a suppression cannot hide quietly.
+      - name: Scan the working tree
+        run: cargo run --release -- --no-color --show-suppressed .
+
+      - name: Scan the full history
+        run: cargo run --release -- --no-color --history .
+
+      - name: Emit SARIF and validate it
+        run: |
+          cargo run --release -- --no-fail -f sarif -o results.sarif .
+          python3 - <<'PY'
+          import json
+          d = json.load(open("results.sarif"))
+          assert d["version"] == "2.1.0", d["version"]
+          run = d["runs"][0]
+          assert run["tool"]["driver"]["name"] == "secret-scan"
+          declared = {r["id"] for r in run["tool"]["driver"]["rules"]}
+          for r in run["results"]:
+              assert r["ruleId"] in declared, f"undeclared rule: {r['ruleId']}"
+              line = r["locations"][0]["physicalLocation"]["region"]["startLine"]
+              assert line >= 1, f"invalid startLine {line}: GitHub rejects 0"
+          print(f"ok: {len(run['results'])} results, {len(declared)} rules")
+          PY
+
+  behaviour:
+    name: detection and exit codes behave as documented
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+
+      # These assertions mirror the README. If the documented behaviour
+      # changes, this fails rather than the README quietly becoming wrong.
+      - name: A planted secret is found and exits 1
+        run: |
+          mkdir -p /tmp/probe
+          echo 'KEY = "AKIAIOSFODNN7EXAMPLE"' > /tmp/probe/leak.py
+          if ./target/release/secret-scan --no-color /tmp/probe; then
+            echo "::error::a planted AWS key was not detected"; exit 1
+          fi
+          echo "ok: detected and exited non-zero"
+
+      - name: Placeholders produce no findings
+        run: |
+          mkdir -p /tmp/clean
+          cat > /tmp/clean/sample.py <<'PYEOF'
+          password = "changeme"
+          api_key = "YOUR_API_KEY_HERE"
+          token = "${GITHUB_TOKEN}"
+          db = "postgres://user:password@localhost:5432/dev"
+          PYEOF
+          ./target/release/secret-scan --no-color /tmp/clean
+          echo "ok: no false positives"
+
+      - name: The secret never appears in any output format
+        run: |
+          mkdir -p /tmp/leak
+          # Assembled from fragments: GitHub's push protection scans this
+          # repository, and a matchable literal here would block the push.
+          SECRET="ghp_""16C7e42F292c6912E7710c838347Ae178B4a"
+          echo "T = \"$SECRET\"" > /tmp/leak/a.py
+          for fmt in text json sarif; do
+            out=$(./target/release/secret-scan --no-fail --no-color -f $fmt /tmp/leak)
+            if printf '%s' "$out" | grep -qF "$SECRET"; then
+              echo "::error::the $fmt output leaked the secret"; exit 1
+            fi
+          done
+          echo "ok: redaction holds across every format"
+
+      - name: The pre-commit hook blocks a staged secret
+        run: |
+          repo=$(mktemp -d); cd "$repo"
+          git init -q -b main
+          git config user.email ci@example.test && git config user.name CI
+          export PATH="$GITHUB_WORKSPACE/target/release:$PATH"
+          secret-scan --install-hook .
+          echo 'KEY = "AKIAIOSFODNN7EXAMPLE"' > leak.py
+          git add leak.py
+          if git commit -qm "should be blocked"; then
+            echo "::error::the hook did not block the commit"; exit 1
+          fi
+          echo "ok: hook blocked the commit"
+          # And --no-verify must still work, or people will delete the hook.
+          git commit -qm "deliberate bypass" --no-verify
+          echo "ok: --no-verify bypasses as documented"
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit --deny warnings
